@@ -5,7 +5,7 @@ use experimental :rakuast;
 has @!keywords = 'eq', 'ne', 'lt', 'gt', 'gte', 'lte';
 has $.context;
 
-my token in-quote   { \" (.*?) \" | \' (.*?) \' }
+my regex in-quote   { \" (.*?) \" | \' (.*?) \' }
 my token is-numeric { ^ \d+ ['.' \d+]? $        }
 
 sub switch-quotes ( $_ ) {
@@ -61,13 +61,13 @@ multi method append-return ($name, $_) {
   $*return ~= do  {
       when / <in-quote>  / {
           q:to/RAKU/
-          %localdata<\qq[$name]> = '\qq[$0]';
+          %localdata<\qq[$name]> = '\qq«$/<in-quote>[0]»';
 
           RAKU
       }
       when / <is-numeric> / {
           q:to/RAKU/
-          %localdata<\qq[$name]> = '\qq[ .Numeric() ]';
+          %localdata<\qq[$name]> = '\qq[.Numeric()]';
 
           RAKU
       }
@@ -94,7 +94,7 @@ multi method append-return ($name, $_, :$rakuast where *.so) {
             )
           )
         ),
-        right => RakuAST::StrLiteral.new($0.Str)
+        right => RakuAST::StrLiteral.new( $/<in-quote>[0].Str )
       );
     }
 
@@ -221,7 +221,7 @@ method !parse-template(@defs is copy, $localline, :$rakuast) {
 
     for @defs -> $name, $op, $value {
       $rakuast ?? self.append-return($name, $value)
-               !! self.apend-return($name, $value, :rakuast);
+               !! self.append-return($name, $value, :rakuast);
     }
 
     for @templates -> $template is rw {
@@ -234,11 +234,19 @@ method !parse-template(@defs is copy, $localline, :$rakuast) {
     $*return
 }
 
-multi method parse-insert(@defs) {
+multi method parse-insert (*@defs, *%named) {
+  samewith(@defs, :rakuast) if %named<rakuast>;
+  samewith(@defs, :normal);
+}
+multi method parse-insert(*@defs, :$normal is required) {
+    use Test;
+    diag "Insert !rakuast";
     my $localline = 'my $template = $context.get-template-text($tfile);' ~ "\n";
     self!parse-template(@defs, $localline)
 }
-multi method parse-insert(@defs, :$rakuast where *.so) {
+multi method parse-insert(*@defs, :$rakuast is required where *.so) {
+  use Test;
+  diag "Insert rakuast";
   my $localline = RakuAST::Statement::Expression.new(
     expression => RakuAST::VarDeclaration::Simple.new(
       name => '$template',
@@ -391,7 +399,7 @@ multi method parse-set(:$default, *@values is copy) {
         $return ~= do given $value {
             when / <in-quote>  / {
                 q:to/RAKU/
-                $stash.put('\qq[$name]', '\qq[$0]');
+                $stash.put('\qq[$name]', '\qq«$/<in-quote>[0]»');
 
                 RAKU
             }
@@ -486,8 +494,9 @@ multi method parse-conditional(Str:D $name, @stmts is copy, :$rakuast) {
     for @stmts -> $stmt is rw {
         next if @!keywords.grep($stmt);
         next if $stmt ~~ /^ \d+ $/;
-        if /^ (\w+) $/ -> $word {
+        if $stmt ~~ /^ (\w+) $/ -> $word {
             if $rakuast {
+                say "S: { $statement.^name } / { $statement }";
                 $statement.push: self!doFromStash('get', $word, :strict)
             } else {
                 $stmt .= subst($word, "\$stash.get('$word', :strict)");
@@ -495,7 +504,7 @@ multi method parse-conditional(Str:D $name, @stmts is copy, :$rakuast) {
         }
     }
 
-    nextwith($statement, :rakuast);
+    nextwith($statement, :rakuast) if $rakuast;
     $statement = @stmts.join(' ');
     "$name $statement \{\n"
 }
@@ -566,7 +575,7 @@ method parse-elseif(*@stmts) {
 }
 
 method parse-else() {
-    @blocks.push: 'else';
+    @blocks.push: 'else' if @blocks.first( *.head eq 'if', :end );
     q:b[\n} else {\n];
 }
 
@@ -621,7 +630,7 @@ method remove-comment(*@tokens --> List) {
     @tokens.toggle(* ne '#').cache
 }
 
-method action($statement, :$rakuast) {
+method action($statement, :$rakuast = False) {
     my @stmts = $statement
       .lines
       .map({ self.remove-comment(.comb(/ \" .*? \" | \' .*? \' | \S+ /)) })
@@ -669,13 +678,18 @@ method compile($template) {
             $script ~= self.action($statement);
         }
     }
+
+    say $script;
+
     $script ~= q:to/RAKU/;
         return $output;
     }
     RAKU
+
 #    $*ERR.say: "<DEBUG:template>\n$script\n</DEBUG:template>";
     # cw: Handled by $*localdata-defined.
     #$script.subst( / 'my %localdata;' /, '', :nd(2..*) ).EVAL
+    $script.EVAL;
 }
 
 # vim: expandtab shiftwidth=4
