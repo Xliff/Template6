@@ -1,5 +1,7 @@
 unit class Template6::Parser;
 
+use experimental :rakuast;
+
 has @!keywords = 'eq', 'ne', 'lt', 'gt', 'gte', 'lte';
 has $.context;
 
@@ -12,7 +14,50 @@ sub switch-quotes ( $_ ) {
   $_;
 }
 
-method !append-return ($name, $_) {
+method !resolveValue ($_) {
+  # cw: Resolve value into RakuAST nodes unless already RakuAST nodes
+  when .Num !~~ Failure { RakuAST::NumLiteral.new($_) }
+  when .Int !~~ Failure { RakuAST::IntLiteral.new($_) }
+  when Str              { RakuAST::StrLiteral.new($_) }
+  when RakuAST::Node    { $_ }
+
+}
+
+method !resolveGetValue ($value, :$strict) {
+  return self!resolveValue($value) unless $strict;
+  (
+    self!resolveValue($value),
+    RakuAST::ColonPair::True.new('strict')
+  )
+}
+
+method !resolvePutValues(@values) {
+  @values.map({ self!resolveValue($_) });
+}
+
+method !doFromStash ($method, $name, *@values, :$strict) {
+  RakuAST::Statement::Expression.new(
+    expression => RakuAST::ApplyPostfix.new(
+      operand => RakuAST::Type::Simple.new(
+        RakuAST::Name.from-identifier('stash')
+      ),
+      postfix => RakuAST::Call::Method.new(
+        name => RakuAST::Name.from-identifier($method),
+        args => do given $name {
+          when 'get' {
+            self!resolveGetValue(@values.head, :$strict)
+          }
+
+          when 'put' {
+            self!resolvePutValues(@values)
+          }
+        }
+      )
+    )
+  )
+}
+
+multi method append-return ($name, $_) {
   $*return ~= do  {
       when / <in-quote>  / {
           q:to/RAKU/
@@ -34,8 +79,7 @@ method !append-return ($name, $_) {
       }
   }
 }
-
-method !append-return ($name, $_, :$rakuast where *.so) {
+multi method append-return ($name, $_, :$rakuast where *.so) {
   $*return.push: {
     when / <in-quote> / {
       RakuAST::ApplyInfix.new(
@@ -84,70 +128,48 @@ method !append-return ($name, $_, :$rakuast where *.so) {
             )
           )
         ),
-        right => RakuAST::Statement::Expression.new(
-          expression => RakuAST::ApplyPostfix.new(
-            operand => RakuAST::Type::Simple.new(
-              RakuAST::Name.from-identifier('stash')
-            ),
-            postfix => RakuAST::Call::Method.new(
-              name => RakuAST::Name.from-identifier('get'),
-              args => RakuAST::StrLiteral.new($_)
-            )
-          )
-        )
-      );
+        right => self!doFromStash('get', $_)
+      )
     }
   }
 }
 
-multi method !define-localdata {
+multi method define-localdata {
   $*return ~= q:to/RAKU/;
     my %localdata;
     RAKU
 }
-multi method !define-localdata (:$rakuast is required) {
+multi method define-localdata (:$rakuast is required) {
   $*return.push: RakuAST::VarDeclaration::Simple.new(
     name => '%localdata'
   );
 }
 
-multi method !define-tfile($localline, $template) {
+multi method define-tfile($localline, $template) {
   $*return ~= q:to/RAKU/;
     {
         my $tfile = $stash.get('\qq[$template]');
 
     RAKU
 
-    $return ~= $localline;
-    $return ~= q:to/RAKU/;
+  $*return ~= $localline;
+  $*return ~= q:to/RAKU/;
         with $template { $output ~= $_; }
 
     RAKU
 
-    $return ~= q:to/RAKU/;
+  $*return ~= q:to/RAKU/;
     }
     RAKU
 }
-multi method !define-tfile($localline, $template, :$rakuast where *.so) {
+multi method define-tfile($localline, $template, :$rakuast where *.so) {
   $*return.push: RakuAST::Block.new(
     body => RakuAST::Blockoid.new(
       RakuAST::StatementList.new(
         RakuAST::Statement::Expression.new(
           expression => RakuAST::VarDeclaration::Simple.new(
             name => '$tfile',
-            initializer => RakuAST::Initializer::Assign.new(
-              RakuAST::Statement::Expression.new(
-                expression => RakuAST::ApplyPostfix.new(
-                  operand => RakuAST::Type::Simple.new(
-                    RakuAST::Name.from-identifier('$stash')
-                  ),
-                  postfix => RakuAST::Call::Method.new(
-                    name => RakuAST::Name.from-identifier('get'),
-                    args => RakuAST::StrLiteral.new($template)
-                  )
-                )
-              )
-            )
+            initializer => self!doFromStash('get', $template)
           )
         ),
         $localline,
@@ -190,21 +212,25 @@ method !parse-template(@defs is copy, $localline, :$rakuast) {
         }
     }
 
-    $rakuast ?? self!define-localdata
-             !! self!define-localdata(:rakuast);
+    unless $*localdata-defined {
+      $rakuast ?? self.define-localdata
+               !! self.define-localdata(:rakuast);
+      $*localdata-defined = True;
+    }
 
 
     for @defs -> $name, $op, $value {
-      $rakuast ?? self!append-return($name, $value)
-               !! self!append-return($name, $value, :rakuast);
+      $rakuast ?? self.append-return($name, $value)
+               !! self.apend-return($name, $value, :rakuast);
     }
 
     for @templates -> $template is rw {
         $template = switch-quotes($template);
 
-        $rakuast ?? self!define-tfile($localline, $template)
-                 !! self!define-tfile($localline, $template, :rakuast);
+        $rakuast ?? self.define-tfile($localline, $template)
+                 !! self.define-tfile($localline, $template, :rakuast);
     }
+
     $*return
 }
 
@@ -213,7 +239,7 @@ multi method parse-insert(@defs) {
     self!parse-template(@defs, $localline)
 }
 multi method parse-insert(@defs, :$rakuast where *.so) {
-  my $localline: RakuAST::Statement::Expression.new(
+  my $localline = RakuAST::Statement::Expression.new(
     expression => RakuAST::VarDeclaration::Simple.new(
       name => '$template',
       initializer => RakuAST::Initializer::Assign.new(
@@ -231,7 +257,7 @@ multi method parse-insert(@defs, :$rakuast where *.so) {
       )
     )
   );
-  self!parse-template(@defs, $localline, :rakuast);
+  self.parse-template(@defs, $localline, :rakuast);
 }
 
 multi method parse-include (*@defs, *%named) {
@@ -241,7 +267,7 @@ multi method parse-include (*@defs, *%named) {
 multi method parse-include(@defs, :$normal) {
     my $localline = 'my $template = $context.process($tfile, :localise, |%localdata);' ~ "\n";
     self!parse-template(@defs, $localline)
-}1
+}
 multi method parse-include (@defs, :$rakuast where *.so) {
   my $localline =  RakuAST::Statement::Expression.new(
     expression => RakuAST::VarDeclaration::Simple.new(
@@ -320,7 +346,7 @@ multi method parse-get(Str:D $name) {
     RAKU
 }
 multi method parse-get(Str:D $name, :$rakuast where *.so) {
-  @ast.push: RakuAST::Statement::Expression.new(
+  @*statements.push: RakuAST::Statement::Expression.new(
     expression => RakuAST::MetaInfix::Assign.new(
       RakuAST::ApplyInfix.new(
         infix => RakuAST::Infix.new("~"),
@@ -337,19 +363,20 @@ multi method parse-call(Str:D $name) {
     RAKU
 }
 multi method parse-call (Str:D $name, :$rakuast where *.so) {
-  RakuAST::ApplyPostfix.new(
-    operand => RakuAST::Type::Simple.new(
-      RakuAST::Name.from-identifier('$stash')
-    ),
-    postfix => RakuAST::Call::Method.new(
-      name => RakuAST::Name.from-identifier('get'),
-      args => RakuAST::QuotedString.new(
-        segments   => (
-          RakuAST::StrLiteral.new($name),
-        )
-      )
-    )
-  );
+  # RakuAST::ApplyPostfix.new(
+  #   operand => RakuAST::Type::Simple.new(
+  #     RakuAST::Name.from-identifier('$stash')
+  #   ),
+  #   postfix => RakuAST::Call::Method.new(
+  #     name => RakuAST::Name.from-identifier('get'),
+  #     args => RakuAST::QuotedString.new(
+  #       segments   => (
+  #         RakuAST::StrLiteral.new($name),
+  #       )
+  #     )
+  #   )
+  # );
+  self!doFromStash('get', $name);
 }
 
 multi method parse-set(:$default, *@values is copy) {
@@ -395,79 +422,29 @@ multi method parse-set(:$default, :$rakuast where *.so, *@values is copy) {
   for @values -> $name, $op, $value {
     @statements.push: do given $value {
       when / <in-quote>  / {
-        RakuAST::ApplyPostfix.new(
-          operand => RakuAST::Type::Simple.new(
-            RakuAST::Name.from-identifier('$stash')
-          ),
-          postfix => RakuAST::Call::Method.new(
-            name => RakuAST::Name.from-identifier('put'),
-            args => (
-              RakuAST::StrLiteral.new($name),
-              RakuAST::StrLiteral.new($0.Str),
-            )
-          )
-        )
+        self!doFromStash('put', $name, $0.Str);
       }
 
       when / <is-numeric> / {
-        RakuAST::ApplyPostfix.new(
-          operand => RakuAST::Type::Simple.new(
-            RakuAST::Name.from-identifier('$stash')
-          ),
-          postfix => RakuAST::Call::Method.new(
-            name => RakuAST::Name.from-identifier('put'),
-            args => (
-              RakuAST::StrLiteral.new($name),
-              RakuAST::Term::TopicCall.new(
-                postfix => RakuAST::Call::Method.new(
-                  name => RakuAST::Name.from-identifier('Numeric'),
-                )
-              )
+        self!doFromStash(
+          'put',
+          $name,
+          RakuAST::Term::TopicCall.new(
+            postfix => RakuAST::Call::Method.new(
+              name => RakuAST::Name.from-identifier('Numeric')
             )
           )
         )
       }
 
       default {
-        RakuAST::ApplyPostfix.new(
-          operand => RakuAST::Type::Simple.new(
-            RakuAST::Name.from-identifier('$stash')
-          ),
-          postfix => RakuAST::Call::Method.new(
-            name => RakuAST::Name.from-identifier('put'),
-            args => (
-              RakuAST::StrLiteral.new($name),
-              RakuAST::ApplyPostfix.new(
-                operand => RakuAST::Type::Simple.new(
-                  RakuAST::Name.from-identifier('$stash')
-                ),
-                postfix => RakuAST::Call::Method.new(
-                  name => RakuAST::Name.from-identifier('get'),
-                  args => RakuAST::StrLiteral.new($value)
-                )
-              )
-            )
-          )
-        )
+        self!doFromStash('put', $name, self!doFromStash('get', $value) )
       }
     }
 
     if $default {
       @statements = RakuAST::Statement::Unless(
-        condition => RakuAST::ApplyPostfix.new(
-          operand => RakuAST::Type::Simple.new(
-            RakuAST::Name.from-identifier('$stash')
-          ),
-          postfix => RakuAST::Call::Method.new(
-            name => RakuAST::Name.from-identifier('get'),
-            args => RakuAST::QuotedString.new(
-              segments   => (
-                RakuAST::StrLiteral.new($name),
-                RakuAST::ColonPair::True.new('strict') ,
-              )
-            )
-          )
-        ),
+        condition => self!doFromStash('get', $name, :strict),
         body => RakuAST::Block.new(
           body => RakuAST::Blockoid.new(
             RakuAST::StatementList.new( |@statements )
@@ -483,7 +460,7 @@ method parse-default(*@values ,:$rakuast) {
 }
 
 my @blocks;
-method parse-for($left, $op, $right, :$rakuast) {
+multi method parse-for($left, $op, $right, :$rakuast) {
     my $itemname;
     my $loopname;
     if ($op.lc eq '=' | 'in') {
@@ -494,49 +471,35 @@ method parse-for($left, $op, $right, :$rakuast) {
         $itemname = $left;
         $loopname = $right;
     }
-    nextwith($left, $op, $right, :rakuast) if $rakuast;
+    nextwith($itemname, $loopname, :rakuast) if $rakuast;
     q:to/RAKU/
     for @($stash.get('\qq[$itemname]', :strict)) -> $\qq[$loopname] {
         $stash.put('\qq[$loopname]', $\qq[$loopname]);
     RAKU
 }
-multi method parse-for ($left, $op, $right, :$rakuast where *.so) {
-  @blocks.push: ['for', $left, $op, $right];
+multi method parse-for ($itemname, $loopname, :$rakuast where *.so) {
+  @blocks.push: ['for', $itemname, $loopname];
 }
 
-method !parse-conditional(Str:D $name, @stmts is copy, :$rakuast) {
-    my @words;
-    my @statements;
+multi method parse-conditional(Str:D $name, @stmts is copy, :$rakuast) {
+    my (@words, $statement);
     for @stmts -> $stmt is rw {
         next if @!keywords.grep($stmt);
         next if $stmt ~~ /^ \d+ $/;
-        if /^ (\w+) $/, -> $word {
+        if /^ (\w+) $/ -> $word {
             if $rakuast {
-                @statements.push: RakuAST::ApplyPostfix.new(
-                    operand => RakuAST::Type::Simple.new(
-                        RakuAST::Name.from-identifier('$stash')
-                    ),
-                    postfix => RakuAST::Call::Method.new(
-                        name => RakuAST::Name.from-identifier('get'),
-                        args => RakuAST::QuotedString.new(
-                            segments   => (
-                                RakuAST::StrLiteral.new($word),
-                                RakuAST::ColonPair::True.new('strict') ,
-                            )
-                        )
-                    )
-                )
+                $statement.push: self!doFromStash('get', $word, :strict)
             } else {
-                $stmt .= subst($word { "\$stash.get('$word', :strict)" });
+                $stmt .= subst($word, "\$stash.get('$word', :strict)");
             }
         }
     }
 
-    my $statement = @stmts.join(' ');
-    nextwith($statement, :rakuast) if $rakuast;
+    nextwith($statement, :rakuast);
+    $statement = @stmts.join(' ');
     "$name $statement \{\n"
 }
-method !parse-conditional($statement, :$rakuast where *.so) {
+multi method parse-conditional($statement, :$rakuast where *.so) {
    my $node = {
       when 'if'               { RakuAST::Statement::If     }
       when 'unless'           { RakuAST::Statement::Unless }
@@ -557,15 +520,15 @@ method !parse-conditional($statement, :$rakuast where *.so) {
 
    (
      $statement ~~ /^
-       [ $<neg>=['!' \s* ]?
+       [ $<neg>=['!' \s* ] ]?
        (.+?)
        [ \s* <operator> \s* (.+?) ]?
      $/
-   )
+   );
 
-   $statement ~~ /^ (.+?) \s* <operator> \s* (.+?) $/
+   $statement ~~ /^ (.+?) \s* <operator> \s* (.+?) $/;
 
-   my $prefix;
+   my ($prefix, $infix, $rhs);
    my $condition = do {
 
      when $/<neg> {
@@ -573,32 +536,28 @@ method !parse-conditional($statement, :$rakuast where *.so) {
         proceed;
      }
 
-     when $1 {
-       $lhs = $1;
-     }
-
      default {
-       $infix = $/<operator>
+       $infix = $/<operator>;
        $rhs = $2;
      }
    }
 
-   @block.push: [
-     [ $node, $lhs, $prefix, $infix, $rhs ]
+   @blocks.push: [
+     [ $node, $prefix, $statement, $infix, $rhs ]
    ];
 }
 
 
 method parse-if(*@stmts) {
-    self!parse-conditional('if', @stmts)
+    self.parse-conditional('if', @stmts)
 }
 
 method parse-unless(*@stmts) {
-    self!parse-conditional('unless', @stmts)
+    self.parse-conditional('unless', @stmts)
 }
 
 method parse-elsif(*@stmts) {
-    "\n}\n" ~ self!parse-conditional('elsif', @stmts)
+    "\n}\n" ~ self.parse-conditional('elsif', @stmts)
 }
 
 # cw: ... Here.
@@ -607,13 +566,55 @@ method parse-elseif(*@stmts) {
 }
 
 method parse-else() {
-    q:b[\n} else {\n]
-    @blocks.push: 'else'
+    @blocks.push: 'else';
+    q:b[\n} else {\n];
 }
 
-method parse-end {
+multi method parse-end {
     # cw: Oh. Dear. GOD! The horror...
     "\n}\n"
+}
+multi method parse-end ( :$rakuast where *.so ) {
+  my $block = @blocks.tail;
+
+  given $block.head {
+    # Look for last if.
+    my $last-if = @blocks.first( .head eq 'if' ).grep(* ~~ Pair).head;
+    when 'else' {
+      # Look for elsif or if.
+      $last-if<else> = RakuAST::StatementList.new(
+      );
+    }
+
+
+    when 'elsif' {
+      $last-if<elsifs> = [] unless $last-if<elsifs>;
+
+      # [ $node, $prefix, $statement, $infix, $rhs ]
+      my $lhs =  $block[2];
+      $lhs = RakuAST::ApplyPrefix.new(
+        prefix  => RakuAST::Prefix.new('!'),
+        operand => $lhs
+      ) if $block[1];
+      $last-if<elsifs>.push: @blocks.tail.head.new(
+        condition =>  RakuAST::ApplyInfix.new(
+          operator => RakuAST::Infix.new( $block[3] ),
+          left     => $lhs,
+          right    => self!resolveValue($block.tail)
+        )
+        #then => ...
+      );
+    }
+
+    when 'for' {
+      #for @($stash.get('\qq[$itemname]', :strict)) -> $\qq[$loopname] {
+      #    $stash.put('\qq[$loopname]', $\qq[$loopname]);
+      #@*statements.push:
+    }
+
+    when 'unless' | 'if' {
+    }
+  }
 }
 
 method remove-comment(*@tokens --> List) {
@@ -630,7 +631,7 @@ method action($statement, :$rakuast) {
     my $name = @stmts.shift.lc;
     my $method = 'parse-' ~ $name;
     self.can($method)
-      ?? $rakuast ?? self."$method"(|@stmts, :$rakuast)
+      ?? self."$method"(|@stmts, :$rakuast)
       !! @stmts.elems >= 2 && @stmts[0] eq '='
         ?? self.parse-set($name, |@stmts, :$rakuast)
         !! self.parse-get($name, :$rakuast)
@@ -642,6 +643,7 @@ method get-safe-delimiter($raw-text) {
 }
 
 method compile($template) {
+    my $*localdata-defined = False;
     my $script = q:to/RAKU/;
     return sub ($context) {
         my $stash = $context.stash;
@@ -672,7 +674,8 @@ method compile($template) {
     }
     RAKU
 #    $*ERR.say: "<DEBUG:template>\n$script\n</DEBUG:template>";
-    $script.subst( / 'my %localdata;' /, '', :nd(2..*) ).EVAL
+    # cw: Handled by $*localdata-defined.
+    #$script.subst( / 'my %localdata;' /, '', :nd(2..*) ).EVAL
 }
 
 # vim: expandtab shiftwidth=4
