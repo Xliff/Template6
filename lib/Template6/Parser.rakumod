@@ -8,7 +8,7 @@ has $.context;
 my regex in-quote   { \" (.*?) \" | \' (.*?) \' }
 my token is-numeric { ^ \d+ ['.' \d+]? $        }
 
-sub switch-quotes ( $_ ) {
+sub switch-quotes ($_  is rw) {
   s/^[\"|\']//;
   s/[\"|\']$//;
   $_;
@@ -79,7 +79,9 @@ multi method append-return ($name, $_) {
       }
   }
 }
-multi method append-return ($name, $_, :$rakuast where *.so) {
+multi method append-return ($name, $_, :$rakuast is required where *.so) {
+  nextwith($name, $_) if $*return ~~ Str;
+  say "{ &?ROUTINE.name } pushing to: { $*return.^name }";
   $*return.push: {
     when / <in-quote> / {
       RakuAST::ApplyInfix.new(
@@ -135,17 +137,18 @@ multi method append-return ($name, $_, :$rakuast where *.so) {
 }
 
 multi method define-localdata {
-  $*return ~= q:to/RAKU/;
-    my %localdata;
-    RAKU
+  say "Appending to \$*return: { $*return.^name }";
+  $*return ~= '  my %localdata;' ~ "\n";
 }
-multi method define-localdata (:$rakuast is required) {
+multi method define-localdata (:$rakuast where *.so) {
+  nextwith() if $*return ~~ Str;
+  say "{ &?ROUTINE.name } pushing to: { $*return.^name }";
   $*return.push: RakuAST::VarDeclaration::Simple.new(
     name => '%localdata'
   );
 }
 
-multi method define-tfile($localline, $template) {
+multi method define-tfile ($localline, $template) {
   $*return ~= q:to/RAKU/;
     {
         my $tfile = $stash.get('\qq[$template]');
@@ -162,7 +165,9 @@ multi method define-tfile($localline, $template) {
     }
     RAKU
 }
-multi method define-tfile($localline, $template, :$rakuast where *.so) {
+multi method define-tfile($localline, $template, :$rakuast is required where *.so) {
+  nextwith($localline, $template) if $*return ~~ Str;
+  say "{ &?ROUTINE.name } pushing to: { $*return.^name }";
   $*return.push: RakuAST::Block.new(
     body => RakuAST::Blockoid.new(
       RakuAST::StatementList.new(
@@ -198,7 +203,9 @@ multi method define-tfile($localline, $template, :$rakuast where *.so) {
 
 ## Incomplete method, supply the $localline which must define a variable called $template
 method !parse-template(@defs is copy, $localline, :$rakuast) {
+    say "{ &?ROUTINE.name } - { $rakuast ?? 'rakuast' !! '!rakuast' }";
     my $*return = $rakuast ?? [] !! '';
+
     my $parsing-templates = True;
     my @templates;
 
@@ -225,6 +232,7 @@ method !parse-template(@defs is copy, $localline, :$rakuast) {
     }
 
     for @templates -> $template is rw {
+        say 'Assigning to rw $template...';
         $template = switch-quotes($template);
 
         $rakuast ?? self.define-tfile($localline, $template)
@@ -388,6 +396,7 @@ multi method parse-call (Str:D $name, :$rakuast where *.so) {
 }
 
 multi method parse-set(:$default, *@values is copy) {
+    say "{ &?ROUTINE.name } - !rakuast";
     my $return = '';
     for @values -> $name, $op, $value {
         if $default {
@@ -451,6 +460,7 @@ multi method parse-set(:$default, :$rakuast where *.so, *@values is copy) {
     }
 
     if $default {
+      say 'Assigning to @statements...';
       @statements = RakuAST::Statement::Unless(
         condition => self!doFromStash('get', $name, :strict),
         body => RakuAST::Block.new(
@@ -458,17 +468,19 @@ multi method parse-set(:$default, :$rakuast where *.so, *@values is copy) {
             RakuAST::StatementList.new( |@statements )
           )
         )
-      )
+      ):$rakuast
     }
   }
 }
 
-method parse-default(*@values ,:$rakuast) {
-    self.parse-set(:default, @values, :$rakuast)
+method parse-default(*@values, :$rakuast) {
+  say "{ &?ROUTINE.name } - { $rakuast ?? 'rakuast' !! '!rakuast' }";
+  self.parse-set(:default, @values, :$rakuast)
 }
 
 my @blocks;
 multi method parse-for($left, $op, $right, :$rakuast) {
+    say "{ &?ROUTINE.name } - { $rakuast ?? 'rakuast' !! '!rakuast' }";
     my $itemname;
     my $loopname;
     if ($op.lc eq '=' | 'in') {
@@ -480,7 +492,7 @@ multi method parse-for($left, $op, $right, :$rakuast) {
         $loopname = $right;
     }
     nextwith($itemname, $loopname, :rakuast) if $rakuast;
-    q:to/RAKU/
+    q:to/RAKU/;
     for @($stash.get('\qq[$itemname]', :strict)) -> $\qq[$loopname] {
         $stash.put('\qq[$loopname]', $\qq[$loopname]);
     RAKU
@@ -490,12 +502,14 @@ multi method parse-for ($itemname, $loopname, :$rakuast where *.so) {
 }
 
 multi method parse-conditional(Str:D $name, @stmts is copy, :$rakuast) {
+    say "{ &?ROUTINE.name } - { $rakuast ?? 'rakuast' !! '!rakuast' }";
     my (@words, $statement);
     for @stmts -> $stmt is rw {
         next if @!keywords.grep($stmt);
         next if $stmt ~~ /^ \d+ $/;
         if $stmt ~~ /^ (\w+) $/ -> $word {
             if $rakuast {
+                say "{ &?ROUTINE.name } pushing to: { $*return.^name }";
                 say "S: { $statement.^name } / { $statement }";
                 $statement.push: self!doFromStash('get', $word, :strict)
             } else {
@@ -580,10 +594,12 @@ method parse-else() {
 }
 
 multi method parse-end {
+    say "{ &?ROUTINE.name } - !rakuast";
     # cw: Oh. Dear. GOD! The horror...
     "\n}\n"
 }
 multi method parse-end ( :$rakuast where *.so ) {
+  say "{ &?ROUTINE.name } - { $rakuast ?? 'rakuast' !! '!rakuast' }";
   my $block = @blocks.tail;
 
   given $block.head {
@@ -605,20 +621,21 @@ multi method parse-end ( :$rakuast where *.so ) {
         prefix  => RakuAST::Prefix.new('!'),
         operand => $lhs
       ) if $block[1];
+      say "{ &?ROUTINE.name } pushing to: { $last-if<elsifs>.^name }";
       $last-if<elsifs>.push: @blocks.tail.head.new(
         condition =>  RakuAST::ApplyInfix.new(
           operator => RakuAST::Infix.new( $block[3] ),
           left     => $lhs,
           right    => self!resolveValue($block.tail)
-        )
-        #then => ...
+        ),
+        then => []
       );
     }
 
     when 'for' {
       #for @($stash.get('\qq[$itemname]', :strict)) -> $\qq[$loopname] {
       #    $stash.put('\qq[$loopname]', $\qq[$loopname]);
-      #@*statements.push:
+      #@*statements.4:
     }
 
     when 'unless' | 'if' {
@@ -631,6 +648,7 @@ method remove-comment(*@tokens --> List) {
 }
 
 method action($statement, :$rakuast = False) {
+    say "{ &?ROUTINE.name } - { $rakuast ?? 'rakuast' !! '!rakuast' }";
     my @stmts = $statement
       .lines
       .map({ self.remove-comment(.comb(/ \" .*? \" | \' .*? \' | \S+ /)) })
@@ -647,6 +665,7 @@ method action($statement, :$rakuast = False) {
 }
 
 method get-safe-delimiter($raw-text) {
+    say "{ &?ROUTINE.name } - !rakuast";
     my Set() $raw-words = $raw-text.words;
     (1..*).map('END' ~ *).first(* !(elem) $raw-words)
 }
