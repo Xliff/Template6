@@ -489,7 +489,12 @@ multi method parse-for($left, $op, $right, :$rakuast) {
     RAKU
 }
 multi method parse-for ($itemname, $loopname, :$rakuast where *.so) {
-  @blocks.push: ['for', $itemname, $loopname];
+  @blocks.push: {
+    node => 'for',
+
+    :$itemname,
+    :$loopname
+  };
 }
 
 method get-last-if-block {
@@ -521,10 +526,11 @@ multi method parse-conditional($node, $statement, :$rakuast where *.so) {
    #    when 'elsif' | 'elseif' { RakuAST::Statement::Elsif  }
    # }
 
+   my $last-if = self.get-last-if-block;
    given $node {
      when 'elsif' | 'elseif' | 'else' {
        # cw: This should be an error, although I suspect the parser will catch it.
-       die 'No proceeding IF!' unless (my $last-if = self.get-last-if-block);
+       die 'No proceeding IF!' unless $last-if;
        proceed;
      }
 
@@ -550,32 +556,25 @@ multi method parse-conditional($node, $statement, :$rakuast where *.so) {
    #     For now, we will only support simple statements, so comparisons
    #     where the RHS is a simple literal is the only thing that is in scope.
 
+   my (@operators, @keywords) = (@!operators, @!keywords);
    my token operator {
-     <{ @!operators }> | <{ @!keywords }>
+     <{ @operators }> | <{ @keywords }>
    }
 
-   (
-     $statement ~~ /^
-       [ $<neg>=['!' \s* ] ]?
-       (.+?)
-       [ \s* <operator> \s* (.+?) ]?
-     $/
-   );
-
-   $statement ~~ /^ (.+?) \s* <operator> \s* (.+?) $/;
+   my ($condition, $not);
+   ($condition, $not) = ( $0, $/<neg> ) if $statement ~~ /^
+     [ $<neg>=['!' \s* ] ]?
+     (.+?)
+     [ \s* <operator> \s* (.+?) ]?
+   $/;
 
    my ($prefix, $infix, $rhs);
-   my $condition = do {
+   $prefix = '!' if $/<neg>;
 
-     when $/<neg> {
-        $prefix = '!';
-        proceed;
-     }
-
-     default {
-       $infix = $/<operator>;
-       $rhs = $2;
-     }
+   $statement ~~ / <operator> \s* (.+?) $/;
+   if $/ {
+     $infix = $/<operator>;
+     $rhs   = $1;
    }
 
    $last-if{$node}.push: $node ne 'else'
@@ -618,49 +617,50 @@ multi method parse-end {
 }
 multi method parse-end ( :$rakuast where *.so ) {
   my $block = @blocks.pop;
-  @*statements := @block.tail<statements>;
+  @*statements := @blocks.tail<statements>;
+
+  sub getCondition {
+    $block<condition> = RakuAST::ApplyPrefix.new(
+      prefix  => RakuAST::Prefix.new('!'),
+      operand => $block<lhs>
+    ) if $block<not>;
+
+    $block<operator>
+      ?? RakuAST::ApplyInfix.new(
+           operator => RakuAST::Infix.new( $block<operator> ),
+           left     => $block<condition>,
+           right    => self!resolveValue($block<rhs>)
+         )
+      !! $block<condition>,
+    then => RakuAST::Block.new(
+      body => RakuAST::Blockoid.new(
+        RakuAST::StatementList.new( |$block<statements> )
+      )
+    )
+  }
 
   given $block<node> {
-
     when 'if' {
       my @elsifs;
 
       if +$block<elsifs> {
         for $block<elsifs>[] {
-
           # This may need to be moved to 'parse-else'
           # { :$node, :$not, :$condition, :$infix, :$rhs, :$statements };
 
           # cw: Only good for logical expressions!
-          $block<condition> = RakuAST::ApplyPrefix.new(
-            prefix  => RakuAST::Prefix.new('!'),
-            operand => $lhs
-          ) if $block<not>;
-
-          @elsifs.push: $block<operator>
-            ?? RakuAST::Statement::Elsif.new(
-                 condition =>  RakuAST::ApplyInfix.new(
-                   operator => RakuAST::Infix.new( $operator ),
-                   left     => $block<condition>,
-                   right    => self!resolveValue($block<rhs>)
-                 ),
-                 then => RakuAST::Block.new(
-                   body => RakuAST::Blockoid.new(
-                     RakuAST::StatementList.new( |.<statements> )
-                   )
-                 )
-               )
-            !! RakuAST::Statement::Elsif.new(
-                 condition => $block<condition>,
-                 then => RakuAST::Block.new(
-                   body => RakuAST::Blockoid.new(
-                     RakuAST::StatementList.new( |.<statements> )
-                   )
-                 )
-               )
+          @elsifs.push: RakuAST::Statement::Elsif.new(
+            condition =>  getCondition(),
+            then => RakuAST::Block.new(
+              body => RakuAST::Blockoid.new(
+                RakuAST::StatementList.new( |.<statements> )
+              )
+            )
+          )
         }
       }
 
+      my $else;
       if $block<else> {
         # Look for elsif or if.
         $else = RakuAST::Block.new(
@@ -671,14 +671,7 @@ multi method parse-end ( :$rakuast where *.so ) {
       }
 
       @*statements.push: RakuAST::Statement::If.new(
-        #condition => ...
-        then => RakuAST::Block.new(
-          body => RakuAST::Blockoid.new(
-            RakuAST::StatementList.new(
-              |$block<statements>
-            )
-          )
-        ),
+        condition => getCondition(),
         elsifs => +@elsifs ?? @elsifs !! Nil,
         'else' => $else    ?? $else   !! Nil
       );
@@ -693,18 +686,24 @@ multi method parse-end ( :$rakuast where *.so ) {
       #     consider adding them.
 
       @*statements.push: RakuAST::Statement::For.new(
-        source => self.doFromStash('get', $itemname, :strict),
+        source => self.doFromStash('get', $block<itemname>, :strict),
         body  => RakuAST::PointyBlock.new(
           signature => RakuAST::Signature.new(
             parameters => (
               RakuAST::Parameter.new(
-                target => RakuAST::ParameterTarget::Var.new("\${ $loopname }")
+                target => RakuAST::ParameterTarget::Var.new(
+                  "\${ $block<loopname> }"
+                )
               )
             )
-          )
+          ),
           body => RakuAST::Blockoid.new(
-            RakuAST::StatementList.new(.
-              self.doFromStash('put', $loopname, "\${ $loopname }"),
+            RakuAST::StatementList.new(
+              self.doFromStash(
+                'put',
+                $block<loopname>,
+                "\${ $block<loopname> }"
+              ),
               RakuAST::Label.new( $block<label> ),
               |$block<statements>
             )
@@ -715,7 +714,7 @@ multi method parse-end ( :$rakuast where *.so ) {
 
     when 'unless' {
       @*statements.push: RakuAST::Statement::Unless.new(
-        # condition => ...,
+        condition => getCondition(),
         body => RakuAST::Block.new(
           body => RakuAST::Blockoid.new(
             RakuAST::StatementList.new( |$block<statements> )
@@ -733,7 +732,7 @@ method remove-comment(*@tokens --> List) {
 method action($statement, :$rakuast = False) {
     my @stmts = $statement
       .lines
-      .map({ self.remove-comment(.comb(/ \" .*? \" | \' .*? \' | \S+ /)) })
+      .map({ self.remove-comment( .comb(/ \" .*? \" | \' .*? \' | \S+ /)) })
       .flat;
     return '' unless @stmts;
 
@@ -749,7 +748,7 @@ method action($statement, :$rakuast = False) {
 method get-safe-delimiter($raw-text) {
     say "{ &?ROUTINE.name } - !rakuast";
     my Set() $raw-words = $raw-text.words;
-    (1..*).map('END' ~ *).first(* !(elem) $raw-words)
+    (1 .. *).map('END' ~ *).first(* !(elem) $raw-words)
 }
 
 method get-segments ($template) {
@@ -759,7 +758,7 @@ method get-segments ($template) {
   );
 }
 
-method compile($template) {
+multi method compile ($template) {
     my $*localdata-defined = False;
     my $script = q:to/RAKU/;
     return sub ($context) {
@@ -768,8 +767,8 @@ method compile($template) {
 
     RAKU
 
-    for self!get-segments($template)[] -> $segment {
-        if $segment ~~ Stringy
+    for self.get-segments($template)[] -> $segment {
+        if $segment ~~ Stringy {
             my $safe-delimiter = self.get-safe-delimiter($segment);
             # Please do not change the string generation logic
             # without paying attention to the implications and
@@ -816,14 +815,14 @@ multi method compile($template, :$rakuast is required where *.so) {
     ),
     RakuAST::Statement::Expression.new(
       expression => RakuAST::VarDeclaration::Simple.new(
-        name => RakuAST::Name.from-identifier('$output')
+        name        => RakuAST::Name.from-identifier('$output'),
         initializer => RakAST::StrLiteral('')
       )
     )
   );
 
-  for self!get-segments($template) -> $segment {
-    my @list
+  for self.get-segments($template) -> $segment {
+    my @list;
     if +@blocks {
       @blocks.tail<statements> = [] unless @blocks.tail<statements>;
       @list := @blocks.tail<statements>;
@@ -850,10 +849,9 @@ multi method compile($template, :$rakuast is required where *.so) {
     expression => RakuAST::Sub.new(
       signature => RakuAST::Signature.new(
         parameters => (
-            RakuAST::Parameter.new(
-              target => RakuAST::ParameterTarget::Var.new('$context')
-            ),
-          )
+          RakuAST::Parameter.new(
+            target => RakuAST::ParameterTarget::Var.new('$context')
+          ),
         ),
         body => RakuAST::Blockoid.new(
           RakuAST::StatementList.new( |@script-statements );
